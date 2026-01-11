@@ -36,6 +36,15 @@ class AISystemResponse(BaseModel):
     class Config:
         from_attributes = True
 
+class RequirementStatusUpdate(BaseModel):
+    """Schema for updating requirement status"""
+    status: ComplianceStatus = Field(..., description="New compliance status")
+    notes: Optional[str] = Field(None, description="Notes about this requirement or status change")
+    updated_by: Optional[str] = Field(None, max_length=255, description="Email of person updating")
+    
+    class Config:
+        use_enum_values = True
+
 app = FastAPI(
     title="WatchGraph API",
     description="Continuous AI Compliance Monitoring Platform",
@@ -331,6 +340,66 @@ async def get_system_compliance(system_id: str, db: Session = Depends(get_db)):
         "requirements_in_progress": status_counts["in_progress"],
         "requirements_not_started": status_counts["not_started"],
         "requirements_non_compliant": status_counts["non_compliant"]
+    }
+
+# Requirement Status Update Endpoint
+@app.put("/api/requirements/{mapping_id}")
+async def update_requirement_status(
+    mapping_id: str,
+    update: RequirementStatusUpdate,
+    db: Session = Depends(get_db)
+):
+    """
+    Update the compliance status of a requirement
+    
+    Allows updating the status, notes, and tracking who made the change.
+    
+    - **mapping_id**: UUID of the requirement mapping
+    - **status**: New status (not_started, in_progress, completed, non_compliant)
+    - **notes**: Optional notes about the requirement or change
+    - **updated_by**: Email of person making the update
+    """
+    from models import RequirementMapping
+    
+    # Find the requirement mapping
+    mapping = db.query(RequirementMapping).filter(
+        RequirementMapping.id == mapping_id
+    ).first()
+    
+    if not mapping:
+        raise HTTPException(status_code=404, detail="Requirement mapping not found")
+    
+    # Store old status for logging
+    old_status = mapping.status.value
+    
+    # Update the mapping
+    mapping.status = ComplianceStatus(update.status)
+    if update.notes is not None:
+        mapping.notes = update.notes
+    if update.updated_by is not None:
+        mapping.updated_by = update.updated_by
+    
+    db.commit()
+    db.refresh(mapping)
+    
+    # Get the requirement details for response
+    requirement = db.query(ComplianceRequirement).filter(
+        ComplianceRequirement.id == mapping.requirement_id
+    ).first()
+    
+    print(f"✅ Requirement '{requirement.title}' status changed: {old_status} → {update.status}")
+    
+    import json
+    return {
+        "mapping_id": mapping.id,
+        "requirement_id": requirement.id,
+        "article": requirement.article,
+        "title": requirement.title,
+        "old_status": old_status,
+        "new_status": mapping.status.value,
+        "notes": mapping.notes,
+        "updated_by": mapping.updated_by,
+        "updated_at": mapping.updated_at.isoformat()
     }
 
 @app.get("/api/compliance")

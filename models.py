@@ -68,6 +68,7 @@ class RequirementMapping(Base):
     
     status = Column(Enum(ComplianceStatus), default=ComplianceStatus.NOT_STARTED)
     notes = Column(Text)
+    updated_by = Column(String(255), nullable=True)  # Email of who updated it
     
     # Timestamps
     created_at = Column(DateTime, default=datetime.utcnow)
