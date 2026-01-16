@@ -1,6 +1,6 @@
-fastapi[all]==0.109.0
-uvicorn[standard]==0.27.0
-sqlalchemy==2.0.25
-pydantic==2.5.3
-python-dotenv==1.0.0
-alembic==1.13.1
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+sqlalchemy==2.0.35
+pydantic==2.9.2
+pydantic-core==2.23.4
+python-multipart==0.0.17
