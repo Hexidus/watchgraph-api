@@ -1,13 +1,14 @@
+import os
 from fastapi import HTTPException, Security
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import jwt, JWTError
 import requests
 from functools import lru_cache
 
-# Your Cognito configuration
-COGNITO_REGION = "us-east-2"
-COGNITO_USER_POOL_ID = "us-east-2_4qSZVI2WH"
-COGNITO_APP_CLIENT_ID = "223nnbea9edf3tach13ilck1mq"
+# Read Cognito configuration from environment variables
+COGNITO_REGION = os.getenv("COGNITO_REGION", "us-east-2")
+COGNITO_USER_POOL_ID = os.getenv("COGNITO_USER_POOL_ID", "us-east-2_4qSZVI2WH")
+COGNITO_APP_CLIENT_ID = os.getenv("COGNITO_APP_CLIENT_ID", "223nnbea9edf3tach13ilck1mq")
 
 # Construct the JWKs URL
 COGNITO_JWKS_URL = f"https://cognito-idp.{COGNITO_REGION}.amazonaws.com/{COGNITO_USER_POOL_ID}/.well-known/jwks.json"
@@ -23,8 +24,6 @@ def get_jwks():
 def verify_token(credentials: HTTPAuthorizationCredentials = Security(security)):
     """
     Verify the JWT token from AWS Cognito
-    
-    Returns the decoded token payload if valid, raises HTTPException if invalid
     """
     token = credentials.credentials
     
@@ -44,13 +43,15 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Security(security))
         if not key:
             raise HTTPException(status_code=401, detail="Invalid token: key not found")
         
-        # Verify and decode the token
+        # Verify and decode the token (removed audience check for access tokens)
         payload = jwt.decode(
             token,
             key,
             algorithms=['RS256'],
-            audience=COGNITO_APP_CLIENT_ID,
-            options={"verify_exp": True}
+            options={
+                "verify_exp": True,
+                "verify_aud": False  # Cognito access tokens don't have audience
+            }
         )
         
         return payload
@@ -63,11 +64,11 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Security(security))
 def get_current_user(token_payload: dict = Security(verify_token)):
     """
     Extract user information from the validated token
-    
-    Returns user email and sub (user ID)
     """
+    # Handle both ID token and access token formats
+    email = token_payload.get("email") or token_payload.get("username")
     return {
-        "email": token_payload.get("email"),
+        "email": email,
         "sub": token_payload.get("sub"),
-        "username": token_payload.get("cognito:username")
+        "username": token_payload.get("cognito:username") or token_payload.get("username")
     }

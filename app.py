@@ -1,14 +1,18 @@
 from auth import get_current_user, verify_token
-from fastapi import FastAPI, Depends, HTTPException, File, UploadFile, Form, Security
+from fastapi import FastAPI, Depends, HTTPException, File, UploadFile, Form, Security, Query
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
 import os
+import uuid
+import json
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from database import get_db, init_db
 from models import (
     AISystem, ComplianceRequirement, RiskCategory, ComplianceStatus,
-    RequirementMapping, Evidence, EvidenceStatus
+    RequirementMapping, Evidence, EvidenceStatus,
+    # NEW: Framework support
+    Framework, RequirementFrameworkMap, ComplianceEvent, EventType, EventSeverity
 )
 from s3_service import (
     generate_s3_key,
@@ -76,10 +80,20 @@ class EvidenceResponse(BaseModel):
     class Config:
         from_attributes = True
 
+# NEW: Schema for compliance events
+class ComplianceEventCreate(BaseModel):
+    """Schema for creating compliance events"""
+    system_id: Optional[str] = None
+    event_type: str
+    title: str
+    description: Optional[str] = None
+    severity: str = "info"
+    framework_refs: List[dict] = []
+
 app = FastAPI(
     title="WatchGraph API",
     description="Continuous AI Compliance Monitoring Platform",
-    version="1.0.0",
+    version="1.1.0",  # Updated version
     docs_url="/api/docs",
     redoc_url="/api/redoc"
 )
@@ -87,11 +101,8 @@ app = FastAPI(
 # CORS middleware for frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "https://watchgraph-ui.vercel.app"
-    ],
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -100,7 +111,7 @@ app.add_middleware(
 async def startup_event():
     """Initialize database on startup"""
     init_db()
-    print("🚀 WatchGraph API started successfully!")
+    print("🚀 WatchGraph API v1.1.0 started - Multi-framework support enabled!")
 
 @app.get("/")
 async def home():
@@ -108,10 +119,11 @@ async def home():
     return {
         "message": "Hello from WatchGraph - Continuous AI Compliance Monitoring Platform",
         "company": "Hexidus",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "status": "running",
         "timestamp": datetime.utcnow().isoformat(),
-        "description": "Real-time monitoring and compliance checking for AI systems"
+        "description": "Real-time monitoring and compliance checking for AI systems",
+        "features": ["Multi-framework support", "EU AI Act", "NIST AI RMF", "ISO 42001"]
     }
 
 @app.get("/health")
@@ -129,53 +141,312 @@ async def version():
     """Version information endpoint"""
     return {
         "service": "WatchGraph",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "platform": "Continuous AI Compliance Monitoring",
         "company": "Hexidus",
         "environment": os.getenv("ENVIRONMENT", "development")
     }
 
 # ============================================
-# DASHBOARD ENDPOINT
+# NEW: FRAMEWORK ENDPOINTS
+# ============================================
+
+@app.get("/api/frameworks")
+async def list_frameworks(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    List all compliance frameworks with requirement counts
+    
+    Returns frameworks like EU AI Act, NIST AI RMF, ISO 42001
+    """
+    frameworks = db.query(Framework).all()
+    
+    result = []
+    for fw in frameworks:
+        # Count requirements mapped to this framework
+        req_count = db.query(RequirementFrameworkMap).filter(
+            RequirementFrameworkMap.framework_id == fw.id
+        ).count()
+        
+        result.append({
+            "id": fw.id,
+            "name": fw.name,
+            "short_code": fw.short_code,
+            "version": fw.version,
+            "description": fw.description,
+            "color": fw.color,
+            "requirement_count": req_count
+        })
+    
+    return result
+
+@app.get("/api/frameworks/{framework_id}")
+async def get_framework(
+    framework_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get details of a specific framework"""
+    framework = db.query(Framework).filter(Framework.id == framework_id).first()
+    
+    if not framework:
+        raise HTTPException(status_code=404, detail="Framework not found")
+    
+    req_count = db.query(RequirementFrameworkMap).filter(
+        RequirementFrameworkMap.framework_id == framework.id
+    ).count()
+    
+    return {
+        "id": framework.id,
+        "name": framework.name,
+        "short_code": framework.short_code,
+        "version": framework.version,
+        "description": framework.description,
+        "color": framework.color,
+        "requirement_count": req_count
+    }
+
+# ============================================
+# NEW: COMPLIANCE BY FRAMEWORK (for donut chart)
+# ============================================
+
+@app.get("/api/compliance/by-framework")
+async def get_compliance_by_framework(
+    system_id: Optional[str] = Query(None, description="Filter by AI system"),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Get compliance percentage grouped by framework for donut chart
+    
+    Returns overall compliance and per-framework breakdown
+    """
+    frameworks = db.query(Framework).all()
+    
+    # Base query for requirement mappings
+    base_query = db.query(RequirementMapping)
+    if system_id:
+        base_query = base_query.filter(RequirementMapping.ai_system_id == system_id)
+    
+    # Calculate overall compliance
+    total_mappings = base_query.count()
+    completed_mappings = base_query.filter(
+        RequirementMapping.status == ComplianceStatus.COMPLETED
+    ).count()
+    
+    overall_compliance = 0
+    if total_mappings > 0:
+        overall_compliance = round((completed_mappings / total_mappings) * 100, 1)
+    
+    # Calculate per-framework compliance
+    framework_data = []
+    for fw in frameworks:
+        # Get requirement IDs for this framework
+        framework_req_ids = db.query(RequirementFrameworkMap.requirement_id).filter(
+            RequirementFrameworkMap.framework_id == fw.id
+        ).subquery()
+        
+        # Count total and completed for this framework
+        fw_query = base_query.filter(
+            RequirementMapping.requirement_id.in_(framework_req_ids)
+        )
+        
+        fw_total = fw_query.count()
+        fw_completed = fw_query.filter(
+            RequirementMapping.status == ComplianceStatus.COMPLETED
+        ).count()
+        
+        fw_compliance = 0
+        if fw_total > 0:
+            fw_compliance = round((fw_completed / fw_total) * 100, 1)
+        
+        framework_data.append({
+            "id": fw.id,
+            "name": fw.name,
+            "short_code": fw.short_code,
+            "color": fw.color,
+            "total_requirements": fw_total,
+            "completed": fw_completed,
+            "compliance_pct": fw_compliance
+        })
+    
+    return {
+        "overall_compliance": overall_compliance,
+        "total_requirements": total_mappings,
+        "completed_requirements": completed_mappings,
+        "frameworks": framework_data
+    }
+
+# ============================================
+# NEW: ACTIVITY FEED ENDPOINTS
+# ============================================
+
+@app.get("/api/compliance/activity-feed")
+async def get_activity_feed(
+    limit: int = Query(20, ge=1, le=100, description="Number of events to return"),
+    offset: int = Query(0, ge=0, description="Pagination offset"),
+    severity: Optional[str] = Query(None, description="Filter by severity: info, warning, alert, success"),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Get recent compliance events for the activity feed
+    
+    Returns chronological list of compliance events with framework tags
+    """
+    query = db.query(ComplianceEvent)
+    
+    # Apply severity filter
+    if severity:
+        try:
+            severity_enum = EventSeverity(severity)
+            query = query.filter(ComplianceEvent.severity == severity_enum)
+        except ValueError:
+            pass  # Invalid severity, ignore filter
+    
+    # Get total count before pagination
+    total = query.count()
+    
+    # Order by most recent and paginate
+    events = query.order_by(ComplianceEvent.created_at.desc()) \
+        .offset(offset) \
+        .limit(limit) \
+        .all()
+    
+    result = []
+    for event in events:
+        # Get system name if exists
+        system_name = None
+        if event.system_id:
+            system = db.query(AISystem).filter(AISystem.id == event.system_id).first()
+            if system:
+                system_name = system.name
+        
+        # Process framework refs
+        framework_tags = []
+        if event.framework_refs:
+            for ref in event.framework_refs:
+                fw = db.query(Framework).filter(Framework.id == ref.get("framework_id")).first()
+                if fw:
+                    framework_tags.append({
+                        "short_code": fw.short_code,
+                        "name": fw.name,
+                        "color": fw.color,
+                        "article_ref": ref.get("article_ref")
+                    })
+        
+        result.append({
+            "id": event.id,
+            "system_id": event.system_id,
+            "system_name": system_name,
+            "event_type": event.event_type.value if hasattr(event.event_type, 'value') else str(event.event_type),
+            "title": event.title,
+            "description": event.description,
+            "severity": event.severity.value if hasattr(event.severity, 'value') else str(event.severity),
+            "frameworks": framework_tags,
+            "created_at": event.created_at.isoformat()
+        })
+    
+    return {
+        "events": result,
+        "total": total,
+        "limit": limit,
+        "offset": offset
+    }
+
+@app.post("/api/compliance/events", status_code=201)
+async def create_compliance_event(
+    event_data: ComplianceEventCreate,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Create a new compliance event (for activity feed)"""
+    try:
+        event_type = EventType(event_data.event_type)
+    except ValueError:
+        event_type = EventType.CONFIG_CHANGE
+    
+    try:
+        severity = EventSeverity(event_data.severity)
+    except ValueError:
+        severity = EventSeverity.INFO
+    
+    event = ComplianceEvent(
+        id=str(uuid.uuid4()),
+        system_id=event_data.system_id,
+        event_type=event_type,
+        title=event_data.title,
+        description=event_data.description,
+        severity=severity,
+        framework_refs=event_data.framework_refs
+    )
+    
+    db.add(event)
+    db.commit()
+    db.refresh(event)
+    
+    return {
+        "id": event.id,
+        "event_type": event.event_type.value,
+        "title": event.title,
+        "severity": event.severity.value,
+        "created_at": event.created_at.isoformat()
+    }
+
+# ============================================
+# DASHBOARD ENDPOINT (Updated with framework filter)
 # ============================================
 
 @app.get("/api/dashboard/stats")
 async def get_dashboard_stats(
+    framework_id: Optional[str] = Query(None, description="Filter by framework"),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """
     Get overall dashboard statistics across all AI systems
     
+    Supports optional framework filtering.
     Requires authentication.
     """
-    # Total systems
     total_systems = db.query(AISystem).count()
     
-    # Total requirements across all systems
-    total_requirements = db.query(RequirementMapping).count()
+    # Build requirement query with optional framework filter
+    req_query = db.query(RequirementMapping)
     
-    # Completed requirements
-    completed_requirements = db.query(RequirementMapping).filter(
+    if framework_id:
+        # Get requirement IDs for this framework
+        framework_req_ids = db.query(RequirementFrameworkMap.requirement_id).filter(
+            RequirementFrameworkMap.framework_id == framework_id
+        ).subquery()
+        req_query = req_query.filter(RequirementMapping.requirement_id.in_(framework_req_ids))
+    
+    total_requirements = req_query.count()
+    completed_requirements = req_query.filter(
         RequirementMapping.status == ComplianceStatus.COMPLETED
     ).count()
     
-    # Calculate overall compliance
     if total_requirements == 0:
         overall_compliance = 0
     else:
         overall_compliance = round((completed_requirements / total_requirements) * 100, 2)
+    
+    # Get framework count
+    framework_count = db.query(Framework).count()
     
     return {
         "total_systems": total_systems,
         "total_requirements": total_requirements,
         "completed_requirements": completed_requirements,
         "overall_compliance": overall_compliance,
+        "framework_count": framework_count,
         "user_email": current_user["email"]
     }
 
 # ============================================
-# AI SYSTEMS ENDPOINTS
+# AI SYSTEMS ENDPOINTS (Updated with framework filter)
 # ============================================
 
 @app.post("/api/systems", response_model=AISystemResponse, status_code=201)
@@ -184,14 +455,7 @@ async def create_ai_system(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Register a new AI system for compliance monitoring
-    
-    Automatically assigns applicable EU AI Act requirements based on risk category.
-    """
-    import json
-    
-    # Create new AI system
+    """Register a new AI system for compliance monitoring"""
     db_system = AISystem(
         name=system.name,
         description=system.description,
@@ -205,12 +469,11 @@ async def create_ai_system(
     db.commit()
     db.refresh(db_system)
     
-    # Automatically assign applicable requirements based on risk category
     applicable_requirements = db.query(ComplianceRequirement).all()
     
     requirements_assigned = 0
     for requirement in applicable_requirements:
-        applies_to = json.loads(requirement.applies_to)
+        applies_to = json.loads(requirement.applies_to) if isinstance(requirement.applies_to, str) else requirement.applies_to
         if system.risk_category in applies_to:
             mapping = RequirementMapping(
                 ai_system_id=db_system.id,
@@ -221,6 +484,21 @@ async def create_ai_system(
             requirements_assigned += 1
     
     db.commit()
+    
+    # NEW: Create system created event for activity feed
+    try:
+        event = ComplianceEvent(
+            id=str(uuid.uuid4()),
+            system_id=db_system.id,
+            event_type=EventType.SYSTEM_CREATED,
+            title=f"New AI system registered: {db_system.name}",
+            description=f"Risk category: {system.risk_category}. {requirements_assigned} requirements assigned.",
+            severity=EventSeverity.INFO
+        )
+        db.add(event)
+        db.commit()
+    except Exception as e:
+        print(f"Warning: Could not create event: {e}")
     
     print(f"✅ Created AI system '{db_system.name}' with {requirements_assigned} requirements assigned")
     
@@ -238,11 +516,24 @@ async def create_ai_system(
 
 @app.get("/api/systems", response_model=List[AISystemResponse])
 async def list_ai_systems(
+    framework_id: Optional[str] = Query(None, description="Filter by framework"),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """List all registered AI systems"""
-    systems = db.query(AISystem).all()
+    """List all registered AI systems with optional framework filter"""
+    if framework_id:
+        # Get systems that have requirements from this framework
+        framework_req_ids = db.query(RequirementFrameworkMap.requirement_id).filter(
+            RequirementFrameworkMap.framework_id == framework_id
+        ).subquery()
+        
+        system_ids = db.query(RequirementMapping.ai_system_id).filter(
+            RequirementMapping.requirement_id.in_(framework_req_ids)
+        ).distinct().subquery()
+        
+        systems = db.query(AISystem).filter(AISystem.id.in_(system_ids)).all()
+    else:
+        systems = db.query(AISystem).all()
     
     return [
         AISystemResponse(
@@ -283,26 +574,57 @@ async def get_ai_system(
         updated_at=system.updated_at.isoformat()
     )
 
+@app.delete("/api/systems/{system_id}", status_code=204)
+async def delete_ai_system(
+    system_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Delete an AI system and all its associated data"""
+    system = db.query(AISystem).filter(AISystem.id == system_id).first()
+    
+    if not system:
+        raise HTTPException(status_code=404, detail="AI system not found")
+    
+    db.query(Evidence).filter(Evidence.ai_system_id == system_id).delete()
+    db.query(RequirementMapping).filter(RequirementMapping.ai_system_id == system_id).delete()
+    db.delete(system)
+    db.commit()
+    
+    print(f"✅ AI system '{system.name}' and all associated data deleted")
+    
+    return None
+
 # ============================================
-# REQUIREMENTS ENDPOINTS
+# REQUIREMENTS ENDPOINTS (Updated with framework info)
 # ============================================
 
 @app.get("/api/requirements")
 async def list_requirements(
+    framework_id: Optional[str] = Query(None, description="Filter by framework"),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """List all EU AI Act compliance requirements"""
-    requirements = db.query(ComplianceRequirement).all()
+    """List all compliance requirements with optional framework filter"""
+    if framework_id:
+        # Get requirements for this framework
+        mappings = db.query(RequirementFrameworkMap).filter(
+            RequirementFrameworkMap.framework_id == framework_id
+        ).all()
+        req_ids = [m.requirement_id for m in mappings]
+        requirements = db.query(ComplianceRequirement).filter(
+            ComplianceRequirement.id.in_(req_ids)
+        ).all()
+    else:
+        requirements = db.query(ComplianceRequirement).all()
     
-    import json
     return [
         {
             "id": req.id,
             "article": req.article,
             "title": req.title,
             "description": req.description,
-            "applies_to": json.loads(req.applies_to)
+            "applies_to": json.loads(req.applies_to) if isinstance(req.applies_to, str) else req.applies_to
         }
         for req in requirements
     ]
@@ -310,17 +632,29 @@ async def list_requirements(
 @app.get("/api/systems/{system_id}/requirements")
 async def get_system_requirements(
     system_id: str,
+    framework_id: Optional[str] = Query(None, description="Filter by framework"),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Get all compliance requirements for a specific AI system"""
+    """Get all compliance requirements for a specific AI system with optional framework filter"""
     system = db.query(AISystem).filter(AISystem.id == system_id).first()
     if not system:
         raise HTTPException(status_code=404, detail="AI system not found")
     
-    mappings = db.query(RequirementMapping).filter(
+    mappings_query = db.query(RequirementMapping).filter(
         RequirementMapping.ai_system_id == system_id
-    ).all()
+    )
+    
+    # Apply framework filter if provided
+    if framework_id:
+        framework_req_ids = db.query(RequirementFrameworkMap.requirement_id).filter(
+            RequirementFrameworkMap.framework_id == framework_id
+        ).subquery()
+        mappings_query = mappings_query.filter(
+            RequirementMapping.requirement_id.in_(framework_req_ids)
+        )
+    
+    mappings = mappings_query.all()
     
     results = []
     for mapping in mappings:
@@ -329,7 +663,22 @@ async def get_system_requirements(
         ).first()
         
         if requirement:
-            import json
+            # NEW: Get framework tags for this requirement
+            fw_mappings = db.query(RequirementFrameworkMap).filter(
+                RequirementFrameworkMap.requirement_id == requirement.id
+            ).all()
+            
+            frameworks = []
+            for fm in fw_mappings:
+                fw = db.query(Framework).filter(Framework.id == fm.framework_id).first()
+                if fw:
+                    frameworks.append({
+                        "short_code": fw.short_code,
+                        "name": fw.name,
+                        "color": fw.color,
+                        "article_ref": fm.article_ref
+                    })
+            
             results.append({
                 "mapping_id": mapping.id,
                 "requirement_id": requirement.id,
@@ -338,7 +687,8 @@ async def get_system_requirements(
                 "description": requirement.description,
                 "status": mapping.status.value,
                 "notes": mapping.notes,
-                "updated_at": mapping.updated_at.isoformat()
+                "updated_at": mapping.updated_at.isoformat(),
+                "frameworks": frameworks  # NEW: Include framework tags
             })
     
     return results
@@ -346,17 +696,29 @@ async def get_system_requirements(
 @app.get("/api/systems/{system_id}/compliance")
 async def get_system_compliance(
     system_id: str,
+    framework_id: Optional[str] = Query(None, description="Filter by framework"),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Get compliance status overview for an AI system"""
+    """Get compliance status overview for an AI system with optional framework filter"""
     system = db.query(AISystem).filter(AISystem.id == system_id).first()
     if not system:
         raise HTTPException(status_code=404, detail="AI system not found")
     
-    mappings = db.query(RequirementMapping).filter(
+    mappings_query = db.query(RequirementMapping).filter(
         RequirementMapping.ai_system_id == system_id
-    ).all()
+    )
+    
+    # Apply framework filter if provided
+    if framework_id:
+        framework_req_ids = db.query(RequirementFrameworkMap.requirement_id).filter(
+            RequirementFrameworkMap.framework_id == framework_id
+        ).subquery()
+        mappings_query = mappings_query.filter(
+            RequirementMapping.requirement_id.in_(framework_req_ids)
+        )
+    
+    mappings = mappings_query.all()
     
     total_requirements = len(mappings)
     if total_requirements == 0:
@@ -424,9 +786,33 @@ async def update_requirement_status(
         ComplianceRequirement.id == mapping.requirement_id
     ).first()
     
+    # NEW: Create event for status change (for activity feed)
+    try:
+        event_type = EventType.REQUIREMENT_COMPLETED if update.status == "completed" else EventType.CONFIG_CHANGE
+        severity = EventSeverity.SUCCESS if update.status == "completed" else EventSeverity.INFO
+        
+        # Get framework refs for this requirement
+        fw_mappings = db.query(RequirementFrameworkMap).filter(
+            RequirementFrameworkMap.requirement_id == mapping.requirement_id
+        ).all()
+        framework_refs = [{"framework_id": fm.framework_id, "article_ref": fm.article_ref} for fm in fw_mappings]
+        
+        event = ComplianceEvent(
+            id=str(uuid.uuid4()),
+            system_id=mapping.ai_system_id,
+            event_type=event_type,
+            title=f"{requirement.title}" if requirement else "Requirement updated",
+            description=f"Status changed: {old_status} → {update.status}",
+            severity=severity,
+            framework_refs=framework_refs
+        )
+        db.add(event)
+        db.commit()
+    except Exception as e:
+        print(f"Warning: Could not create event: {e}")
+    
     print(f"✅ Requirement '{requirement.title}' status changed: {old_status} → {update.status}")
     
-    import json
     return {
         "mapping_id": mapping.id,
         "requirement_id": requirement.id,
@@ -440,7 +826,7 @@ async def update_requirement_status(
     }
 
 # ============================================
-# EVIDENCE ENDPOINTS (keeping these without auth for now)
+# EVIDENCE ENDPOINTS (Unchanged)
 # ============================================
 
 @app.post("/api/requirements/{mapping_id}/evidence", status_code=201)
@@ -452,22 +838,15 @@ async def upload_evidence(
     uploaded_by: Optional[str] = Form(None, description="Email of uploader"),
     db: Session = Depends(get_db)
 ):
-    """
-    Upload evidence file for a requirement
-    
-    Uploads the file to S3 and stores metadata in the database.
-    """
-    # Verify requirement mapping exists
+    """Upload evidence file for a requirement"""
     mapping = db.query(RequirementMapping).filter(RequirementMapping.id == mapping_id).first()
     if not mapping:
         raise HTTPException(status_code=404, detail="Requirement mapping not found")
     
-    # Get the AI system for organization info
     system = db.query(AISystem).filter(AISystem.id == mapping.ai_system_id).first()
     if not system:
         raise HTTPException(status_code=404, detail="AI system not found")
     
-    # Validate file type
     if not file.filename or '.' not in file.filename:
         raise HTTPException(status_code=400, detail="File must have an extension")
     
@@ -478,7 +857,6 @@ async def upload_evidence(
             detail=f"File type '{file_ext}' not allowed. Allowed: {', '.join(ALLOWED_FILE_TYPES)}"
         )
     
-    # Read and validate file size
     file_content = await file.read()
     file_size = len(file_content)
     
@@ -491,7 +869,6 @@ async def upload_evidence(
     if file_size == 0:
         raise HTTPException(status_code=400, detail="File is empty")
     
-    # Generate S3 key
     s3_key = generate_s3_key(
         organization=system.organization,
         system_id=system.id,
@@ -499,14 +876,12 @@ async def upload_evidence(
         filename=file.filename
     )
     
-    # Upload to S3
     try:
         content_type = MIME_TYPE_MAP.get(file_ext, "application/octet-stream")
         upload_file_to_s3(file_content, s3_key, content_type)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     
-    # Parse expiration date if provided
     exp_date = None
     if expiration_date:
         try:
@@ -514,7 +889,6 @@ async def upload_evidence(
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
     
-    # Create database record
     evidence = Evidence(
         ai_system_id=system.id,
         requirement_mapping_id=mapping_id,
@@ -532,6 +906,31 @@ async def upload_evidence(
     db.commit()
     db.refresh(evidence)
     
+    # NEW: Create event for evidence upload
+    try:
+        requirement = db.query(ComplianceRequirement).filter(
+            ComplianceRequirement.id == mapping.requirement_id
+        ).first()
+        
+        fw_mappings = db.query(RequirementFrameworkMap).filter(
+            RequirementFrameworkMap.requirement_id == mapping.requirement_id
+        ).all()
+        framework_refs = [{"framework_id": fm.framework_id, "article_ref": fm.article_ref} for fm in fw_mappings]
+        
+        event = ComplianceEvent(
+            id=str(uuid.uuid4()),
+            system_id=system.id,
+            event_type=EventType.EVIDENCE_UPLOADED,
+            title=f"Evidence uploaded: {file.filename}",
+            description=f"For requirement: {requirement.title}" if requirement else None,
+            severity=EventSeverity.SUCCESS,
+            framework_refs=framework_refs
+        )
+        db.add(event)
+        db.commit()
+    except Exception as e:
+        print(f"Warning: Could not create event: {e}")
+    
     print(f"✅ Evidence '{file.filename}' uploaded for requirement mapping {mapping_id}")
     
     return {
@@ -545,7 +944,6 @@ async def upload_evidence(
             "created_at": evidence.created_at.isoformat()
         }
     }
-
 
 @app.get("/api/requirements/{mapping_id}/evidence")
 async def list_requirement_evidence(
@@ -593,7 +991,6 @@ async def list_requirement_evidence(
         "page_size": page_size
     }
 
-
 @app.get("/api/systems/{system_id}/evidence")
 async def list_system_evidence(
     system_id: str,
@@ -601,7 +998,7 @@ async def list_system_evidence(
     page_size: int = 20,
     db: Session = Depends(get_db)
 ):
-    """List all evidence for an AI system (across all requirements)"""
+    """List all evidence for an AI system"""
     system = db.query(AISystem).filter(AISystem.id == system_id).first()
     if not system:
         raise HTTPException(status_code=404, detail="AI system not found")
@@ -641,7 +1038,6 @@ async def list_system_evidence(
         "page_size": page_size
     }
 
-
 @app.get("/api/evidence/{evidence_id}")
 async def get_evidence(evidence_id: str, db: Session = Depends(get_db)):
     """Get details of a specific evidence file"""
@@ -668,10 +1064,9 @@ async def get_evidence(evidence_id: str, db: Session = Depends(get_db)):
         "updated_at": evidence.updated_at.isoformat()
     }
 
-
 @app.get("/api/evidence/{evidence_id}/download")
 async def download_evidence(evidence_id: str, db: Session = Depends(get_db)):
-    """Get a pre-signed download URL for evidence (expires in 5 minutes)"""
+    """Get a pre-signed download URL for evidence"""
     evidence = db.query(Evidence).filter(
         Evidence.id == evidence_id,
         Evidence.deleted_at.is_(None)
@@ -695,7 +1090,6 @@ async def download_evidence(evidence_id: str, db: Session = Depends(get_db)):
         "file_name": evidence.file_name,
         "file_type": evidence.file_type
     }
-
 
 @app.patch("/api/evidence/{evidence_id}")
 async def update_evidence(
@@ -744,10 +1138,9 @@ async def update_evidence(
         "updated_at": evidence.updated_at.isoformat()
     }
 
-
 @app.delete("/api/evidence/{evidence_id}", status_code=204)
 async def delete_evidence(evidence_id: str, db: Session = Depends(get_db)):
-    """Delete evidence (soft delete - file retained in S3 for audit)"""
+    """Delete evidence (soft delete)"""
     evidence = db.query(Evidence).filter(
         Evidence.id == evidence_id,
         Evidence.deleted_at.is_(None)
@@ -762,7 +1155,6 @@ async def delete_evidence(evidence_id: str, db: Session = Depends(get_db)):
     print(f"✅ Evidence '{evidence.file_name}' soft deleted")
     
     return None
-
 
 @app.get("/api/requirements/{mapping_id}/evidence/stats")
 async def get_evidence_stats(mapping_id: str, db: Session = Depends(get_db)):
@@ -793,7 +1185,6 @@ async def get_evidence_stats(mapping_id: str, db: Session = Depends(get_db)):
     
     return result
 
-
 @app.get("/api/compliance")
 async def compliance():
     """Future endpoint for compliance rule management"""
@@ -804,35 +1195,7 @@ async def compliance():
     }
 
 
-@app.delete("/api/systems/{system_id}", status_code=204)
-async def delete_ai_system(
-    system_id: str,
-    current_user: dict = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """Delete an AI system and all its associated data"""
-    system = db.query(AISystem).filter(AISystem.id == system_id).first()
-    
-    if not system:
-        raise HTTPException(status_code=404, detail="AI system not found")
-    
-    # Delete all evidence for this system
-    db.query(Evidence).filter(Evidence.ai_system_id == system_id).delete()
-    
-    # Delete all requirement mappings for this system
-    db.query(RequirementMapping).filter(RequirementMapping.ai_system_id == system_id).delete()
-    
-    # Delete the system itself
-    db.delete(system)
-    db.commit()
-    
-    print(f"✅ AI system '{system.name}' and all associated data deleted")
-    
-    return None
-
-
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
-
